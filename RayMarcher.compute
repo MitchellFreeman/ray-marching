@@ -1,0 +1,237 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+float4x4 cameraToWorld;
+float4x4 cameraInverseProjection;
+
+float3 lightPos;
+int blend;
+
+static float maxDist = 10000000.0f;
+static float epsilon = 0.001f;
+static float pi = 3.14149265f;
+
+struct Data {
+    float3 position;
+    float3 colour;
+    int type;
+    float3 scale;
+    float3 rotation;
+    float3 extraData;
+};
+
+StructuredBuffer<Data> shapes;
+int numShapes;
+/*
+float length(float3 v) {
+    return sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+*/
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+struct SceneInfo {
+    float3 colour;
+    float distance;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(cameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(cameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(cameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+float SphereSDF(float3 position, float radius) {
+    return length(position) - radius;
+}
+
+float CubeSDF(float3 pos, float3 scale) {
+    return length(max(abs(pos) - scale, 0));
+}
+
+float TorusSDF(float3 position, float radius, float outerRadius) {
+    float2 q = float2(length(position.xz) - radius, position.y);
+    return length(q) - outerRadius;
+}
+
+float ConeSDF(float3 position, float angle, float height) {
+    angle *= pi / 180;
+    if (height == 0) {
+        height = epsilon;
+    }
+    float2 q = height * float2(sin(angle) / cos(angle), -1.0f);
+    float2 w = float2(length(position.xz), position.y);
+    float2 a = w - q * clamp(dot(w, q) / dot(q, q), 0.0f, 1.0f);
+    float2 b = w - q * float2(clamp(w.x / q.x, 0.0f, 1.0f), 1.0f);
+    float k = sign(q.y);
+    float d = min(dot(a, a), dot(b, b));
+    float s = max(k * (w.x * q.y - w.y * q.x), k * (w.y - q.y));
+    return sqrt(d) * sign(s);
+}
+
+float CylinderSDF(float3 position, float height, float radius) {
+    float2 d = abs(float2(length(position.xz), position.y)) - float2(height, radius);
+    return min(max(d.x, d.y), 0.0f) + length(max(d, 0.0f));
+}
+
+float4x4 RotationMatrix(Data shape) {
+    float x = -shape.rotation.x * pi / 180;
+    float y = -shape.rotation.y * pi / 180;
+    float z = -shape.rotation.z * pi / 180;
+    float a = z;
+    float b = y;
+    float g = x;
+    float4x4 xaxis = { 1, 0, 0, 0,
+                       0, cos(x), -sin(x), 0,
+                       0, sin(x), cos(x), 0,
+                       0, 0, 0, 1};
+    float4x4 yaxis = { cos(y), 0, sin(y), 0,
+                       0, 1, 0, 0,
+                       -sin(y), 0, cos(y), 0,
+                       0, 0, 0, 1};
+    float4x4 zaxis = { cos(z), -sin(z), 0, 0,
+                       sin(z), cos(z), 0, 0,
+                       0, 0, 1, 0,
+                       0, 0, 0, 1};
+    float4x4 rotMatrix = {cos(a) * cos(b), cos(a) * sin(b) * sin(g) - sin(a) * cos(g), cos(a) * sin(b) * cos(g) + sin(a) * sin(g), 0,
+                       sin(a) * cos(b), sin(a) * sin(b) * sin(g) + cos(a) * cos(g), sin(a) * sin(b) * cos(g) - cos(a) * sin(g), 0,
+                       -sin(b), cos(b) * sin(g), cos(b) * cos(g), 0,
+                       0, 0, 0, 1};
+
+    return rotMatrix;
+}
+
+SceneInfo ShapeSDF(float3 position, Data shape) {
+    float dist = maxDist;
+    float3 newPosition = mul(float4(position - shape.position, 1), transpose(RotationMatrix(shape))).xyz / shape.scale;
+    SceneInfo info;
+    info.colour = shape.colour;
+    if (shape.type == 0) {
+        dist = SphereSDF(newPosition, shape.extraData.x);
+    } else if (shape.type == 1) {
+        dist = CubeSDF(newPosition, shape.scale);
+    } else if (shape.type == 2) {
+        dist = TorusSDF(newPosition, shape.extraData.x, shape.extraData.y);
+    } else if (shape.type == 3) {
+        dist = ConeSDF(newPosition, shape.extraData.x, shape.extraData.y);
+    } else if (shape.type == 4) {
+        dist = CylinderSDF(newPosition, shape.extraData.x, shape.extraData.y);
+    }
+    info.distance = dist * min(shape.scale.x, min(shape.scale.y, shape.scale.z));
+    return info;
+}
+
+SceneInfo Combine(float prevDist, float newDist, float3 prevColour, float3 newColour) {
+    SceneInfo info;
+    info.distance = prevDist;
+    info.colour = prevColour;
+    if (blend > 0) {
+        float k = 1;
+        float h = clamp( 0.5+0.5*(newDist-prevDist)/k, 0.0, 1.0 );
+        info.distance = lerp(newDist, prevDist, h ) - k*h*(1.0-h);
+        info.colour = lerp(newColour,prevColour,h);
+    } else {
+        if (newDist < prevDist) {
+            info.distance = newDist;
+            info.colour = newColour;
+        }
+    }
+    return info;
+}
+
+
+SceneInfo GetSceneSDF(float3 position) {
+    SceneInfo info;
+    info.colour = float3(0.0f, 0.0f, 0.0f);
+    info.distance = maxDist;
+    for (int i = 0; i < numShapes; i++) {
+        SceneInfo newInfo = ShapeSDF(position, shapes[i]);
+        info = Combine(info.distance, newInfo.distance, info.colour, newInfo.colour);
+    }
+    return info;
+}
+
+float3 EstimateNormal(float3 p) {
+    float eps = epsilon;
+    return normalize(float3(
+        GetSceneSDF(float3(p.x + eps, p.y, p.z)).distance - GetSceneSDF(float3(p.x - eps, p.y, p.z)).distance,
+        GetSceneSDF(float3(p.x, p.y + eps, p.z)).distance - GetSceneSDF(float3(p.x, p.y - eps, p.z)).distance,
+        GetSceneSDF(float3(p.x, p.y, p.z + eps)).distance - GetSceneSDF(float3(p.x, p.y, p.z - eps)).distance
+        ));
+}
+
+float Shadow(Ray ray) {
+    float k = 8;
+
+
+    float res = 1.0f;
+    float t = 1e-20f;
+    //float ph = 1e20;
+
+    float lightDistance = length(lightPos - ray.origin);
+
+    while (t < maxDist && t < lightDistance) {
+        float h = GetSceneSDF(ray.origin + ray.direction * t).distance;
+        if (h < epsilon) {
+            return 0.0f;
+        }
+        res = min(res, k * h / t);
+        t += h;
+    }
+    return res;
+}
+
+SceneInfo March(Ray ray) {
+    float dist = 0.0f;
+    SceneInfo info = GetSceneSDF(ray.origin);
+    while (dist < maxDist) {
+        if (info.distance < epsilon) {
+            float3 normal = EstimateNormal(ray.origin - ray.direction * epsilon * 2);
+            float3 lightDir = normalize(lightPos - ray.origin);
+            float shadow = Shadow(CreateRay(ray.origin + normal * epsilon * 1.001f, lightDir));
+            info.colour = info.colour  * 0.2f +
+                          info.colour * max(0, dot(normal, lightDir)) * shadow;
+            return info;
+        }
+        ray.origin += ray.direction * info.distance;
+        dist += info.distance;
+        info = GetSceneSDF(ray.origin);
+    }
+    info.colour = float3(0, 0, 0);
+    return info;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    Ray ray = CreateCameraRay(uv);
+
+    Result[id.xy] = float4(March(ray).colour, 1);
+}
